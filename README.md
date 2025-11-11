@@ -103,4 +103,4 @@ require('projection').setup{
 
 ## License
 
-MIT © Your Name
+MIT © marciovmf
