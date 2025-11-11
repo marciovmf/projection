@@ -1,0 +1,162 @@
+*projection.nvim.txt*      Stream build/clean output into quickfix in real time *projection.nvim*
+
+==============================================================================
+INTRODUCTION                                                            *projection.nvim-intro*
+
+projection.nvim streams your *build* or *clean* commands to the |quickfix| list
+in real time using Neovim jobs. It understands your |'errorformat'| so
+filenames/line numbers are parsed as errors and warnings. It opens quickfix
+horizontally or vertically (configurable), avoids duplicate quickfix windows,
+and can equalize window sizes (Ctrl-W =).
+
+Per-project configuration is auto-loaded from *project.lua* (preferred) on
+|VimEnter| and |DirChanged|. Legacy names *.projection.lua*, *.nvim/projection.lua*
+are also supported.
+
+==============================================================================
+INSTALLATION                                                            *projection.nvim-install*
+
+Using vim-plug:
+
+>vim
+    Plug 'yourname/projection.nvim'
+<
+
+Requires Neovim 0.7+.
+
+==============================================================================
+CONFIGURATION                                                           *projection.nvim-config*
+
+You can configure globally (via |g:projection|), per project (project.lua), or
+at runtime (|:ProjectionConfig|).
+
+Global example (init.vim):
+>
+    let g:projection = {
+    \ 'project_name': 'MyProject',
+    \ 'build_cmd': ['make', '-j8'],
+    \ 'clean_cmd': ['make', 'clean'],
+    \ 'build_key': '<F9>',
+    \ 'clean_key': '<S-F9>',
+    \ 'open': 'vertical',
+    \ 'qf_width': 60,
+    \ 'equalize': v:true,
+    \ 'notify': v:true,
+    \ 'timeout_sec': 30,
+    \}
+<
+
+Per-project example (project.lua):
+>
+    return {
+      project_name = 'AwesomeApp',
+      build_cmd = { 'ninja', '-v' },           -- argv (no shell)
+      clean_cmd = { 'ninja', '-t', 'clean' },  -- argv (no shell)
+      build_key = '<F9>',
+      clean_key = '<S-F9>',
+      open = 'horizontal',
+      qf_height = 18,
+      equalize = true,
+      timeout_sec = 45,
+    }
+<
+
+Runtime tweaks:
+>
+    :ProjectionConfig open=vertical equalize=true qf_width=64 build_key=<F9> clean_key=<S-F9>
+<
+
+==============================================================================
+KEYMAPS                                                                 *projection.nvim-keymaps*
+
+If *build_key* and/or *clean_key* are set, the plugin creates global normal-mode
+mappings:
+- {build_key} → run |:ProjectionBuild|
+- {clean_key} → run |:ProjectionClean|
+
+When the config changes (new project or runtime update), previous mappings set
+by the plugin are removed and the new ones are installed. To disable, set keys
+to empty string or omit them.
+
+==============================================================================
+COMMANDS                                                                *projection.nvim-commands*
+
+:Projection [cmd ...] / :ProjectionBuild [cmd ...]                  *:Projection*
+    Run the configured **build** command and stream stdout/stderr into the
+    quickfix. If [cmd ...] is provided, it overrides the configured build
+    command for this run. Build falls back to |'makeprg'| or "make" if neither
+    a run-time argument nor |build_cmd| is provided.
+
+:ProjectionClean [cmd ...]                                       *:ProjectionClean*
+    Run the configured **clean** command and stream to quickfix. If cmd is
+    provided, it overrides |clean_cmd| for this run. There is no |'makeprg'|
+    fallback for clean; if not configured, the command is refused.
+
+:ProjectionStop                                                   *:ProjectionStop*
+    Stop the running job (if any).
+
+:ProjectionConfig key=val [key=val ...]                           *:ProjectionConfig*
+    Update configuration at runtime. Known keys include:
+      build_cmd    (string|argv)
+      clean_cmd    (string|argv)
+      build_key    (string, e.g. <F9> or <C-b>)
+      clean_key    (string)
+      open         ('horizontal' | 'vertical' | 'never')
+      qf_height    (number)
+      qf_width     (number)
+      equalize     (true|false)
+      notify       (true|false)
+      timeout_sec  (number, 0 disables)
+      kill_grace_ms (number)
+      hard_kill_signal (number)
+      project_name (string)
+
+==============================================================================
+OPTIONS                                                                 *projection.nvim-options*
+
+Defaults:
+>
+    build_cmd     = nil            " fallback to &makeprg or 'make'
+    clean_cmd     = nil            " disabled unless set
+    open          = 'horizontal'   " 'horizontal' | 'vertical' | 'never'
+    qf_height     = 12
+    qf_width      = 50
+    equalize      = false          " apply Ctrl-W = after opening quickfix
+    notify        = true
+    timeout_sec   = 0              " no timeout
+    kill_grace_ms = 2000
+    hard_kill_signal = 9
+    project_name  = nil
+    build_key     = nil
+    clean_key     = nil
+<
+
+Notes:
+- If *cmd* is a string, it is executed through |'shell'| and |'shellcmdflag'|,
+  so pipelines and redirects work.
+- If *cmd* is a table (argv), it is passed directly to |jobstart()| and does
+  NOT use a shell.
+- When *open* is 'never', the quickfix will not be opened automatically, but
+  will still be populated. Use |:copen| to open it later.
+
+==============================================================================
+STATUSLINE / TITLE                                                      *projection.nvim-status*
+
+If *project_name* is set, the plugin prefixes |'titlestring'| with
+`[PROJECT_NAME]` and provides a statusline fragment via:
+>
+    lua print(require('projection').status())   " -> e.g. [AwesomeApp]
+<
+For classic Vimscript statuslines:
+>
+    set statusline+=%{get(g:,'projection_status','')}
+<
+
+==============================================================================
+AUTHOR & LICENSE                                                        *projection.nvim-author*
+
+Author: Your Name <you@example.com>
+License: MIT
+Repository: https://github.com/yourname/projection.nvim
+
+vim:tw=78:ts=8:ft=help:norl:
