@@ -1,43 +1,30 @@
 -- lua/projection/init.lua
 -- projection.nvim: stream build/clean commands into the quickfix list in real time.
--- All comments and user-facing messages are in ENGLISH.
+-- Adds project-aware config, keymaps, timeouts, header lines, and personality messages.
 
 local M = {}
 
 -- Default configuration
 M.cfg = {
-  -- Build/Clean commands (one can be nil):
-  --   string -> executed via shell (respects pipes/redirects)
-  --   table  -> argv list passed directly to jobstart (no shell)
-  --   nil    -> for build: fallback to &makeprg or "make"; for clean: disabled
   build_cmd = nil,
   clean_cmd = nil,
-
-  -- Quickfix opening strategy: 'horizontal' | 'vertical' | 'never'
   open = 'horizontal',
-
-  -- Quickfix default sizes
-  qf_height = 12,  -- when horizontal
-  qf_width  = 50,  -- when vertical
-
-  -- Equalize windows (Ctrl-W =) right after opening quickfix
+  qf_height = 12,
+  qf_width = 50,
   equalize = false,
-
-  -- Show notifications at the end of the job
   notify = true,
-
-  -- Timeout failsafe
-  timeout_sec = 0,        -- 0 = disabled
-  kill_grace_ms = 2000,   -- grace after soft stop before hard kill
-  hard_kill_signal = 9,   -- SIGKILL by default
-
-  -- Project name (visible in title bar and usable in statusline)
+  timeout_sec = 0,
+  kill_grace_ms = 2000,
+  hard_kill_signal = 9,
   project_name = nil,
-
-  -- Optional keymaps (global, normal mode). Set to nil to skip.
-  -- Examples: '<F9>', '<C-b>'
   build_key = nil,
   clean_key = nil,
+
+  -- Fun / Personality
+  success_icon = nil,
+  fail_icon = nil,
+  success_phrases = {},
+  failure_phrases = {},
 }
 
 local job_id = nil
@@ -45,44 +32,68 @@ local job_pid = nil
 local timeout_timer = nil
 local hardkill_timer = nil
 
--- Keep original titlestring to restore when project changes
 M._orig_titlestring = nil
 M._title_active = false
-
--- Track last applied keymaps so we can unmap when config changes
 M._last_build_key = nil
 M._last_clean_key = nil
 
--- Coerce common Vimscript literal strings into Lua booleans/numbers
+----------------------------------------------------------------------
+-- Private RNG (LCG) so other plugins can't mess with it
+----------------------------------------------------------------------
+
+local RAND_A, RAND_C, RAND_M = 1103515245, 12345, 2 ^ 31
+M._rand_state =
+  (vim.loop and vim.loop.hrtime and (vim.loop.hrtime() % RAND_M)) or (os.time() % RAND_M)
+
+local function prand(n)
+  M._rand_state = (RAND_A * M._rand_state + RAND_C) % RAND_M
+  if n then
+    return (M._rand_state % n) + 1
+  end
+  return M._rand_state
+end
+
+M._last_success_idx = nil
+M._last_failure_idx = nil
+
+----------------------------------------------------------------------
+-- Utility helpers
+----------------------------------------------------------------------
+
 local function coerce(v)
-  if v == 'true'  or v == true  then return true end
-  if v == 'false' or v == false then return false end
+  if v == 'true' or v == true then
+    return true
+  end
+  if v == 'false' or v == false then
+    return false
+  end
   if type(v) == 'string' then
     local n = tonumber(v)
-    if n ~= nil then return n end
+    if n ~= nil then
+      return n
+    end
   end
   return v
 end
 
--- Shallow merge "src" into "dst"
 local function merge_into(dst, src)
-  if type(src) ~= 'table' then return dst end
+  if type(src) ~= 'table' then
+    return dst
+  end
   for k, v in pairs(src) do
     dst[k] = coerce(v)
   end
   return dst
 end
 
---- Setup global defaults (optional)
----@param opts table|nil
 function M.setup(opts)
-  if opts then merge_into(M.cfg, opts) end
-  -- Apply project name and keymaps
+  if opts then
+    merge_into(M.cfg, opts)
+  end
   M._apply_project_name()
   M._apply_keymaps()
 end
 
--- Consume g:projection (Vimscript or Lua)
 function M.apply_global_var()
   local gv = vim.g.projection
   if type(gv) == 'table' then
@@ -90,12 +101,17 @@ function M.apply_global_var()
   end
 end
 
--- Upward search for a file from CWD
+----------------------------------------------------------------------
+-- Project config loader
+----------------------------------------------------------------------
+
 local function find_upwards(names)
   local uv = vim.loop
   local cwd = uv.cwd() or '.'
-  local sep = package.config:sub(1,1)
-  local function join(a,b) return a .. sep .. b end
+  local sep = package.config:sub(1, 1)
+  local function join(a, b)
+    return a .. sep .. b
+  end
 
   local dir = cwd
   local last = nil
@@ -109,20 +125,17 @@ local function find_upwards(names)
     end
     last = dir
     local parent = dir:match('(.*)' .. vim.pesc(sep))
-    if not parent or parent == '' then break end
+    if not parent or parent == '' then
+      break
+    end
     dir = parent
   end
   return nil
 end
 
--- Project config loader: prioritize project.lua, fallback to legacy names
--- The file can:
---   * return a table of options
---   * or return a function(plugin) and call plugin.setup{...}
 function M.load_project_config()
-  local path = find_upwards({ 'project.lua', '.projection.lua', '.nvim/projection.lua' })
+  local path = find_upwards({ 'project.lua', '.make-live.lua', '.nvim/make-live.lua' })
   if not path then
-    -- No project file found, restore title and keymaps if previously set
     M._clear_project_name_effects()
     M._clear_keymaps()
     return false
@@ -147,15 +160,15 @@ function M.load_project_config()
     return true
   end
   vim.b.projection_project_config = path
-  -- Even if file returns nil, apply effects from current cfg
   M._apply_project_name()
   M._apply_keymaps()
   return true
 end
 
--- ---- Project name visibility helpers ----
+----------------------------------------------------------------------
+-- Project name, keymaps, quickfix management
+----------------------------------------------------------------------
 
--- Return formatted status fragment (can be used in statusline)
 function M.status()
   if M.cfg.project_name and tostring(M.cfg.project_name) ~= '' then
     return string.format('[%s]', tostring(M.cfg.project_name))
@@ -171,56 +184,56 @@ function M._clear_project_name_effects()
 end
 
 function M._apply_project_name()
-  -- Update title bar with project name if provided
   local name = M.cfg.project_name
   if name and tostring(name) ~= '' then
     if not M._title_active then
       M._orig_titlestring = vim.o.titlestring ~= '' and vim.o.titlestring or '%f - nvim'
     end
     vim.o.title = true
-    vim.o.titlestring = string.format('[%s] %s', tostring(name), M._orig_titlestring or '%f - nvim')
+    vim.o.titlestring =
+      string.format('[%s] %s', tostring(name), M._orig_titlestring or '%f - nvim')
     M._title_active = true
   else
-    -- No project name: restore previous title
     M._clear_project_name_effects()
   end
 end
 
--- ---- Keymap helpers ----
-
 function M._clear_keymaps()
-  if M._last_build_key then pcall(vim.keymap.del, 'n', M._last_build_key) end
-  if M._last_clean_key then pcall(vim.keymap.del, 'n', M._last_clean_key) end
+  if M._last_build_key then
+    pcall(vim.keymap.del, 'n', M._last_build_key)
+  end
+  if M._last_clean_key then
+    pcall(vim.keymap.del, 'n', M._last_clean_key)
+  end
   M._last_build_key = nil
   M._last_clean_key = nil
 end
 
 function M._apply_keymaps()
-  -- Clear old ones
   M._clear_keymaps()
-  -- Build
   if M.cfg.build_key and tostring(M.cfg.build_key) ~= '' then
-    vim.keymap.set('n', M.cfg.build_key, function() M.run_build() end,
-      { desc = 'projection: build' })
+    vim.keymap.set('n', M.cfg.build_key, function()
+      M.run_build()
+    end, { desc = 'projection: build' })
     M._last_build_key = M.cfg.build_key
   end
-  -- Clean
   if M.cfg.clean_key and tostring(M.cfg.clean_key) ~= '' then
-    vim.keymap.set('n', M.cfg.clean_key, function() M.run_clean() end,
-      { desc = 'projection: clean' })
+    vim.keymap.set('n', M.cfg.clean_key, function()
+      M.run_clean()
+    end, { desc = 'projection: clean' })
     M._last_clean_key = M.cfg.clean_key
   end
 end
 
--- Detect if a quickfix window is already open
 local function has_qf_window()
   for _, win in ipairs(vim.fn.getwininfo()) do
-    if win.quickfix == 1 then return true end
+    if win.quickfix == 1 then
+      return true
+    end
   end
   return false
 end
 
--- Open quickfix according to config, without duplicating windows
 local function open_qf_if_needed(cfg)
   if cfg.open == 'never' or has_qf_window() then
     return
@@ -238,16 +251,24 @@ local function open_qf_if_needed(cfg)
   end
 end
 
--- Append new lines to quickfix (stdout/stderr)
 local function feed(cfg, _, data, _)
-  if not data or #data == 0 then return end
-  if data[#data] == '' then table.remove(data, #data) end
-  if #data == 0 then return end
+  if not data or #data == 0 then
+    return
+  end
+  if data[#data] == '' then
+    table.remove(data, #data)
+  end
+  if #data == 0 then
+    return
+  end
   vim.fn.setqflist({}, 'a', { lines = data, efm = vim.o.errorformat })
   open_qf_if_needed(cfg)
 end
 
--- Resolve final command (argv list)
+----------------------------------------------------------------------
+-- Process + timeout management
+----------------------------------------------------------------------
+
 local function resolve_cmd(cmd, fallback_makeprg)
   if cmd ~= nil then
     if type(cmd) == 'string' then
@@ -256,7 +277,6 @@ local function resolve_cmd(cmd, fallback_makeprg)
       return cmd
     end
   end
-  -- Fallback for build only
   if fallback_makeprg then
     local mp = (vim.o.makeprg ~= '' and vim.o.makeprg) or 'make'
     return { vim.o.shell, vim.o.shellcmdflag, mp }
@@ -264,10 +284,17 @@ local function resolve_cmd(cmd, fallback_makeprg)
   return nil
 end
 
--- ---- timers / termination helpers ----
 local function clear_timers()
-  if timeout_timer then timeout_timer:stop(); timeout_timer:close(); timeout_timer = nil end
-  if hardkill_timer then hardkill_timer:stop(); hardkill_timer:close(); hardkill_timer = nil end
+  if timeout_timer then
+    timeout_timer:stop()
+    timeout_timer:close()
+    timeout_timer = nil
+  end
+  if hardkill_timer then
+    hardkill_timer:stop()
+    hardkill_timer:close()
+    hardkill_timer = nil
+  end
 end
 
 local function still_running()
@@ -276,12 +303,14 @@ end
 
 local function soft_stop()
   if still_running() then
-    pcall(vim.fn.jobstop, job_id) -- polite stop
+    pcall(vim.fn.jobstop, job_id)
   end
 end
 
 local function hard_kill(cfg)
-  if not still_running() then return end
+  if not still_running() then
+    return
+  end
   local uv = vim.loop
   if job_pid and job_pid > 0 then
     pcall(uv.kill, job_pid, tonumber(cfg.hard_kill_signal) or 9)
@@ -289,16 +318,22 @@ local function hard_kill(cfg)
 end
 
 local function schedule_timeout(cfg)
-  if (tonumber(cfg.timeout_sec) or 0) <= 0 then return end
+  if (tonumber(cfg.timeout_sec) or 0) <= 0 then
+    return
+  end
   local uv = vim.loop
   timeout_timer = uv.new_timer()
   timeout_timer:start(cfg.timeout_sec * 1000, 0, function()
-    if not still_running() then return end
+    if not still_running() then
+      return
+    end
     vim.schedule(function()
-      vim.notify(string.format('[projection] timeout after %ds — stopping job...', cfg.timeout_sec), vim.log.levels.WARN)
+      vim.notify(
+        string.format('[projection] timeout after %ds — stopping job...', cfg.timeout_sec),
+        vim.log.levels.WARN
+      )
     end)
     soft_stop()
-    -- schedule hard kill after grace
     hardkill_timer = uv.new_timer()
     hardkill_timer:start(tonumber(cfg.kill_grace_ms) or 2000, 0, function()
       if still_running() then
@@ -311,14 +346,60 @@ local function schedule_timeout(cfg)
   end)
 end
 
--- Common runner with header
+----------------------------------------------------------------------
+-- Personality system
+----------------------------------------------------------------------
+
+local function pick_phrase(list, last_idx)
+  if type(list) ~= 'table' or #list == 0 then
+    return nil, last_idx
+  end
+  local idx = prand(#list)
+  if #list > 1 then
+    local tries = 3
+    while idx == last_idx and tries > 0 do
+      idx = prand(#list)
+      tries = tries - 1
+    end
+  end
+  return list[idx], idx
+end
+
+local function emit_personality(cfg, ok)
+  local icon = ok and cfg.success_icon or cfg.fail_icon
+  local phrase, new_idx
+  if ok then
+    phrase, M._last_success_idx = pick_phrase(cfg.success_phrases, M._last_success_idx)
+  else
+    phrase, M._last_failure_idx = pick_phrase(cfg.failure_phrases, M._last_failure_idx)
+  end
+  if not icon and not phrase then
+    return
+  end
+
+  local line = (icon and (tostring(icon) .. ' ') or '') .. (phrase or '')
+  if line == '' then
+    return
+  end
+
+  -- Visual spacing before the punchline
+  vim.fn.setqflist({}, 'a', { lines = { '', '', line, '' } })
+
+  if cfg.notify then
+    vim.notify(line, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
+  end
+end
+
+----------------------------------------------------------------------
+-- Main runner
+----------------------------------------------------------------------
+
 local function run_with_cmd(cmd_argv, cfg, action_label)
   if not cmd_argv or #cmd_argv == 0 then
     vim.notify('[projection] no command configured', vim.log.levels.WARN)
     return
   end
 
-  -- Prepend a header to the quickfix so the user sees intent and full command.
   local action = action_label or 'Running'
   local header = {}
   if cfg.project_name and tostring(cfg.project_name) ~= '' then
@@ -330,29 +411,49 @@ local function run_with_cmd(cmd_argv, cfg, action_label)
   vim.fn.setqflist({}, 'r', { lines = header })
   open_qf_if_needed(cfg)
 
-  -- Now run and stream output, appending to the quickfix
   clear_timers()
   job_id = vim.fn.jobstart(cmd_argv, {
     stdout_buffered = false,
     stderr_buffered = false,
-    on_stdout = function(...) feed(cfg, ...) end,
-    on_stderr = function(...) feed(cfg, ...) end,
+    on_stdout = function(...)
+      feed(cfg, ...)
+    end,
+    on_stderr = function(...)
+      feed(cfg, ...)
+    end,
     on_exit = function(_, code)
       clear_timers()
       job_pid = nil
+      local ok = (code == 0)
       if cfg.notify then
-        if code == 0 then
+        if ok then
           vim.notify('[projection] job completed successfully')
         else
           vim.notify('[projection] job failed (exit ' .. code .. ')', vim.log.levels.ERROR)
         end
       end
-      if code ~= 0 then
+
+      if not ok then
         local qf = vim.fn.getqflist({ size = 0 })
         if qf.size and qf.size > 0 then
           vim.cmd('cfirst')
         end
       end
+
+      emit_personality(cfg, ok)
+
+      -- Scroll to bottom of quickfix for dramatic effect
+      if has_qf_window() then
+        vim.schedule(function()
+          local qfwin = vim.fn.getqflist({ winid = 0 }).winid
+          if qfwin and qfwin > 0 then
+            vim.api.nvim_win_call(qfwin, function()
+              vim.cmd('normal! G')
+            end)
+          end
+        end)
+      end
+
       job_id = nil
     end,
   })
@@ -360,21 +461,27 @@ local function run_with_cmd(cmd_argv, cfg, action_label)
   schedule_timeout(cfg)
 end
 
---- Run BUILD with optional one-shot overrides: { cmd = '...', open='vertical', ... }
+----------------------------------------------------------------------
+-- Public commands
+----------------------------------------------------------------------
+
 function M.run_build(opts)
   local cfg = {}
   merge_into(cfg, M.cfg)
-  if opts then merge_into(cfg, opts) end
-  local argv = resolve_cmd((opts and opts.cmd) or cfg.build_cmd, true) -- build falls back to makeprg
+  if opts then
+    merge_into(cfg, opts)
+  end
+  local argv = resolve_cmd((opts and opts.cmd) or cfg.build_cmd, true)
   run_with_cmd(argv, cfg, 'Building')
 end
 
---- Run CLEAN with optional one-shot overrides: { cmd = '...' }
 function M.run_clean(opts)
   local cfg = {}
   merge_into(cfg, M.cfg)
-  if opts then merge_into(cfg, opts) end
-  local argv = resolve_cmd((opts and opts.cmd) or cfg.clean_cmd, false) -- clean has no makeprg fallback
+  if opts then
+    merge_into(cfg, opts)
+  end
+  local argv = resolve_cmd((opts and opts.cmd) or cfg.clean_cmd, false)
   if not argv then
     vim.notify('[projection] no clean_cmd configured', vim.log.levels.WARN)
     return
@@ -382,14 +489,12 @@ function M.run_clean(opts)
   run_with_cmd(argv, cfg, 'Cleaning')
 end
 
---- Back-compat: generic run() uses build path
 function M.run(opts)
   return M.run_build(opts)
 end
 
---- Stop the running job (if any)
 function M.stop()
-  if still_running() then
+  if job_id and job_id > 0 then
     clear_timers()
     pcall(vim.fn.jobstop, job_id)
     job_id = nil
